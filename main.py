@@ -7,6 +7,7 @@ import hashlib
 import math
 import shutil
 import subprocess
+import socket
 import string
 import bisect
 import time
@@ -14,6 +15,10 @@ import threading
 import urllib.error
 import urllib.request
 import urllib.parse
+import zipfile
+import tempfile
+import types
+import binascii
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from collections import Counter
@@ -23,17 +28,24 @@ import whisper
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget,
                              QPushButton, QFileDialog, QHBoxLayout, QProgressBar,
                              QSlider, QComboBox, QCheckBox, QListWidget, QListWidgetItem,
-                             QFrame, QScrollArea, QTextBrowser)
+                             QFrame, QScrollArea, QTextBrowser, QMessageBox, QMenu,
+                             QToolButton)
 from PyQt6.QtCore import (QTimer, Qt, QUrl, QThread, pyqtSignal, QRectF, QSettings,
-                          QSignalBlocker)
+                          QSignalBlocker, QSize)
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import (QPixmap, QImage, QPainter, QPainterPath, QColor, QFont,
                          QShortcut, QKeySequence, QIcon, QLinearGradient, QPen)
+from sync_server import SyncServerThread, HTTP_PORT, DISCOVERY_PORT
 
 BASIS_ORDNER = os.path.dirname(os.path.abspath(__file__))
 WOERTERBUCH_DATEI = os.path.join(BASIS_ORDNER, "bekannte_woerter.txt")
 BILDER_ORDNER = os.path.join(BASIS_ORDNER, "bilder")
 CACHE_ORDNER = os.path.join(BASIS_ORDNER, "cache")
+STBOOK_VERSION = 1
+GEMINI_TEXT_MODEL = "gemini-3.8-flash"
+GEMINI_TEXT_FALLBACK_MODEL = "gemini-2.5-flash"
+GEMINI_IMAGE_MODEL = "gemini-3.1-flash-lite-image"
+GEMINI_IMAGE_FALLBACK_MODEL = "gemini-2.5-flash-image"
 SEEK_VORLAUF_MS = 40  # Sprung ein wenig in den Satz hinein (Rundung / Seek-Ungenauigkeit)
 SATZZEICHEN = string.punctuation + " „“”‚‘’«»…–—"
 ARTIKEL_WOERTER = {
@@ -50,6 +62,58 @@ ARTIKEL_WOERTER = {
     "jeder", "jede", "jedes", "jeden", "jedem",
     "welcher", "welche", "welches", "welchen", "welchem",
 }
+
+
+def wortzeitstempel_fuer_tokens(tokens, whisper_woerter, segment_start, segment_ende):
+    """Map Whisper's aligned words onto the whitespace-preserving token list."""
+    wort_token_indizes = [
+        index for index, token in enumerate(tokens) if token["rein"]
+    ]
+    ausgerichtete_woerter = []
+    for eintrag in whisper_woerter or []:
+        wort = eintrag.get("word", "").strip().strip(SATZZEICHEN).casefold()
+        start = eintrag.get("start")
+        ende = eintrag.get("end")
+        if not wort:
+            continue
+        if (
+            not isinstance(start, (int, float))
+            or not isinstance(ende, (int, float))
+            or not math.isfinite(start)
+            or not math.isfinite(ende)
+            or ende <= start
+        ):
+            return None
+        ausgerichtete_woerter.append((wort, start, ende))
+
+    ergebnis = []
+    wort_index = 0
+    letzter_start = segment_start
+    for token_index in wort_token_indizes:
+        zielwort = tokens[token_index]["rein"].casefold()
+        gruppiertes_wort = ""
+        treffer = None
+        for ende_index in range(wort_index, min(wort_index + 4, len(ausgerichtete_woerter))):
+            gruppiertes_wort += ausgerichtete_woerter[ende_index][0]
+            if gruppiertes_wort == zielwort:
+                treffer = ende_index
+                break
+            if not zielwort.startswith(gruppiertes_wort):
+                break
+        if treffer is None:
+            return None
+
+        start = max(segment_start, ausgerichtete_woerter[wort_index][1])
+        ende = min(segment_ende, ausgerichtete_woerter[treffer][2])
+        if start < letzter_start or ende <= start:
+            return None
+        ergebnis.append((token_index, start, ende))
+        letzter_start = start
+        wort_index = treffer + 1
+
+    if wort_index != len(ausgerichtete_woerter):
+        return None
+    return ergebnis
 ZEIT_MENGEN_WOERTER = {
     "heute", "gestern", "morgen", "übermorgen", "vorgestern",
     "jetzt", "bald", "später", "früher", "sofort", "immer", "nie",
@@ -171,6 +235,93 @@ UI_TEXTE = {
         "fr": "Chargement du modèle Whisper ({model})…",
         "es": "Cargando el modelo Whisper ({model})…",
     },
+    "analysis_progress": {
+        "ru": "Анализ аудио: {percent}% · {done} из {total}{eta}",
+        "uk": "Аналіз аудіо: {percent}% · {done} із {total}{eta}",
+        "en": "Analyzing audio: {percent}% · {done} of {total}{eta}",
+        "fr": "Analyse de l'audio : {percent} % · {done} sur {total}{eta}",
+        "es": "Analizando audio: {percent}% · {done} de {total}{eta}",
+    },
+    "analysis_eta": {
+        "ru": " · осталось ≈ {time}", "uk": " · залишилось ≈ {time}",
+        "en": " · about {time} left", "fr": " · reste ≈ {time}",
+        "es": " · quedan ≈ {time}",
+    },
+    "analysis_eta_calculating": {
+        "ru": " · оценка времени…", "uk": " · оцінка часу…",
+        "en": " · estimating time…", "fr": " · estimation du temps…",
+        "es": " · calculando tiempo…",
+    },
+    "reanalyze": {
+        "ru": "↻",
+        "uk": "↻",
+        "en": "↻",
+        "fr": "↻",
+        "es": "↻",
+    },
+    "reanalyze_tooltip": {
+        "ru": "Обновить книгу, используя готовый анализ и переводя только пропущенные предложения",
+        "uk": "Оновити книгу, використовуючи готовий аналіз і перекладаючи лише відсутні речення",
+        "en": "Update the book using saved analysis and translating only missing sentences",
+        "fr": "Mettre à jour le livre avec l’analyse enregistrée et traduire uniquement les phrases manquantes",
+        "es": "Actualizar el libro usando el análisis guardado y traduciendo solo las frases pendientes",
+    },
+    "refresh_translations": {
+        "ru": "Повторить перевод отсутствующих предложений",
+        "uk": "Повторити переклад відсутніх речень",
+        "en": "Retry missing sentence translations",
+        "fr": "Réessayer les traductions manquantes",
+        "es": "Reintentar las traducciones que faltan",
+    },
+    "refresh_speech": {
+        "ru": "Заново распознать аудио (Whisper)",
+        "uk": "Повторно розпізнати аудіо (Whisper)",
+        "en": "Re-run audio transcription (Whisper)",
+        "fr": "Relancer la transcription audio (Whisper)",
+        "es": "Volver a transcribir el audio (Whisper)",
+    },
+    "refresh_images": {
+        "ru": "Повторить загрузку изображений текущего предложения",
+        "uk": "Повторити завантаження зображень поточного речення",
+        "en": "Retry image loading for the current sentence",
+        "fr": "Réessayer le chargement des images de la phrase actuelle",
+        "es": "Reintentar la carga de imágenes de la frase actual",
+    },
+    "refresh_speech_confirm": {
+        "ru": "Повторно распознать аудио, не используя сохранённую транскрипцию? Переводы, уже имеющиеся в кэше, сохранятся; недостающие будут запрошены после анализа.",
+        "uk": "Повторно розпізнати аудіо, не використовуючи збережену транскрипцію? Переклади, які вже є в кеші, збережуться; відсутні буде запитано після аналізу.",
+        "en": "Re-transcribe the audio without using the saved transcript? Cached translations will be kept; missing ones will be requested after analysis.",
+        "fr": "Retranscrire l’audio sans utiliser la transcription enregistrée ? Les traductions en cache seront conservées ; les manquantes seront demandées après l’analyse.",
+        "es": "¿Volver a transcribir el audio sin usar la transcripción guardada? Se conservarán las traducciones en caché y se solicitarán las que falten.",
+    },
+    "refresh_speech_title": {
+        "ru": "Повторное распознавание аудио",
+        "uk": "Повторне розпізнавання аудіо",
+        "en": "Re-run audio transcription",
+        "fr": "Relancer la transcription audio",
+        "es": "Volver a transcribir el audio",
+    },
+    "reanalyze_title": {
+        "ru": "Повторный анализ",
+        "uk": "Повторний аналіз",
+        "en": "Re-analyze",
+        "fr": "Nouvelle analyse",
+        "es": "Volver a analizar",
+    },
+    "reanalyze_confirm": {
+        "ru": "Обновить книгу, используя сохранённый анализ, если он есть? Уже готовые переводы будут взяты из кэша, переведены будут только пропущенные предложения.",
+        "uk": "Оновити книгу, використовуючи збережений аналіз, якщо він є? Готові переклади буде взято з кешу, перекладатимуться лише відсутні речення.",
+        "en": "Update the book using saved analysis if available? Cached translations will be reused; only missing sentences will be translated.",
+        "fr": "Mettre à jour le livre avec l’analyse enregistrée si disponible ? Les traductions en cache seront réutilisées ; seules les phrases manquantes seront traduites.",
+        "es": "¿Actualizar el libro usando el análisis guardado si está disponible? Se reutilizarán las traducciones en caché y solo se traducirán las frases pendientes.",
+    },
+    "saving_transcript": {
+        "ru": "Сохранение результатов анализа…",
+        "uk": "Збереження результатів аналізу…",
+        "en": "Saving analysis results…",
+        "fr": "Enregistrement des résultats de l'analyse…",
+        "es": "Guardando los resultados del análisis…",
+    },
     "analyzing_audio": {
         "ru": "Анализ аудио по предложениям (подождите)…",
         "uk": "Аналіз аудіо за реченнями (зачекайте)…",
@@ -207,6 +358,42 @@ UI_TEXTE = {
     "load_file": {
         "ru": "📂  Открыть файл", "uk": "📂  Відкрити файл",
         "en": "📂  Open file", "fr": "📂  Ouvrir un fichier", "es": "📂  Abrir archivo",
+    },
+    "export_book": {
+        "ru": "Экспорт .stbook", "uk": "Експорт .stbook",
+        "en": "Export .stbook", "fr": "Exporter .stbook",
+        "es": "Exportar .stbook",
+    },
+    "sync_android": {
+        "ru": "Синхронизация с Android", "uk": "Синхронізація з Android",
+        "en": "Sync with Android", "fr": "Synchroniser avec Android",
+        "es": "Sincronizar con Android",
+    },
+    "book_exported": {
+        "ru": "Книга экспортирована: {path}", "uk": "Книгу експортовано: {path}",
+        "en": "Book exported: {path}", "fr": "Livre exporté : {path}",
+        "es": "Libro exportado: {path}",
+    },
+    "book_open_error": {
+        "ru": "Не удалось открыть .stbook: {error}",
+        "uk": "Не вдалося відкрити .stbook: {error}",
+        "en": "Could not open .stbook: {error}",
+        "fr": "Impossible d’ouvrir le .stbook : {error}",
+        "es": "No se pudo abrir el .stbook: {error}",
+    },
+    "book_export_error": {
+        "ru": "Не удалось экспортировать .stbook: {error}",
+        "uk": "Не вдалося експортувати .stbook: {error}",
+        "en": "Could not export .stbook: {error}",
+        "fr": "Impossible d’exporter le .stbook : {error}",
+        "es": "No se pudo exportar el .stbook: {error}",
+    },
+    "translation_not_in_book": {
+        "ru": "Перевод этого предложения не сохранён в книге.",
+        "uk": "Переклад цього речення не збережено в книзі.",
+        "en": "This sentence's translation is not included in the book.",
+        "fr": "La traduction de cette phrase n’est pas incluse dans le livre.",
+        "es": "La traducción de esta frase no está incluida en el libro.",
     },
     "previous_sentence": {
         "ru": "Предыдущее предложение (←)", "uk": "Попереднє речення (←)",
@@ -486,6 +673,18 @@ UI_TEXTE = {
         "en": "New words in this file", "fr": "Nouveaux mots dans ce fichier",
         "es": "Palabras nuevas en este archivo",
     },
+    "remove_book": {
+        "ru": "Удалить из списка", "uk": "Видалити зі списку",
+        "en": "Remove from list", "fr": "Retirer de la liste",
+        "es": "Quitar de la lista",
+    },
+    "remove_book_confirm": {
+        "ru": "Удалить «{name}» из списка? Сам файл останется на диске.",
+        "uk": "Видалити «{name}» зі списку? Сам файл залишиться на диску.",
+        "en": "Remove “{name}” from the list? The file itself stays on disk.",
+        "fr": "Retirer « {name} » de la liste ? Le fichier reste sur le disque.",
+        "es": "¿Quitar «{name}» de la lista? El archivo permanece en el disco.",
+    },
     "undo": {
         "ru": "↩  Отменить", "uk": "↩  Скасувати",
         "en": "↩  Undo", "fr": "↩  Annuler", "es": "↩  Deshacer",
@@ -503,16 +702,18 @@ UI_TEXTE = {
         "es": "Carga un archivo para empezar",
     },
     "choose_file_title": {
-        "ru": "Выберите аудио- или текстовый файл", "uk": "Виберіть аудіо- або текстовий файл",
-        "en": "Choose an audio or text file", "fr": "Choisir un fichier audio ou texte",
-        "es": "Elige un archivo de audio o texto",
+        "ru": "Выберите аудио-, текстовый файл или .stbook",
+        "uk": "Виберіть аудіо-, текстовий файл або .stbook",
+        "en": "Choose an audio, text, or .stbook file",
+        "fr": "Choisir un fichier audio, texte ou .stbook",
+        "es": "Elige un archivo de audio, texto o .stbook",
     },
     "supported_files": {
-        "ru": "Поддерживаемые файлы (*.mp3 *.wav *.m4a *.ogg *.txt)",
-        "uk": "Підтримувані файли (*.mp3 *.wav *.m4a *.ogg *.txt)",
-        "en": "Supported files (*.mp3 *.wav *.m4a *.ogg *.txt)",
-        "fr": "Fichiers pris en charge (*.mp3 *.wav *.m4a *.ogg *.txt)",
-        "es": "Archivos compatibles (*.mp3 *.wav *.m4a *.ogg *.txt)",
+        "ru": "Поддерживаемые файлы (*.mp3 *.wav *.m4a *.ogg *.txt *.stbook)",
+        "uk": "Підтримувані файли (*.mp3 *.wav *.m4a *.ogg *.txt *.stbook)",
+        "en": "Supported files (*.mp3 *.wav *.m4a *.ogg *.txt *.stbook)",
+        "fr": "Fichiers pris en charge (*.mp3 *.wav *.m4a *.ogg *.txt *.stbook)",
+        "es": "Archivos compatibles (*.mp3 *.wav *.m4a *.ogg *.txt *.stbook)",
     },
     "translation_loading": {
         "ru": "Перевод загружается…", "uk": "Переклад завантажується…",
@@ -537,6 +738,27 @@ UI_TEXTE = {
         "ru": "Перевод недоступен: {error}", "uk": "Переклад недоступний: {error}",
         "en": "Translation unavailable: {error}", "fr": "Traduction indisponible : {error}",
         "es": "Traducción no disponible: {error}",
+    },
+    "translation_batch_progress": {
+        "ru": "Подготовка книги: перевод предложений {done}/{total} · осталось ≈ {time}",
+        "uk": "Підготовка книги: переклад речень {done}/{total} · залишилось ≈ {time}",
+        "en": "Preparing book: translating sentences {done}/{total} · about {time} left",
+        "fr": "Préparation du livre : traduction des phrases {done}/{total} · reste ≈ {time}",
+        "es": "Preparando el libro: traduciendo frases {done}/{total} · quedan ≈ {time}",
+    },
+    "translation_batch_complete": {
+        "ru": "Перевод книги готов: {done}/{total} предложений.",
+        "uk": "Переклад книги готовий: {done}/{total} речень.",
+        "en": "Book translation ready: {done}/{total} sentences.",
+        "fr": "Traduction du livre prête : {done}/{total} phrases.",
+        "es": "Traducción del libro lista: {done}/{total} frases.",
+    },
+    "translation_batch_partial": {
+        "ru": "Книга сохранена, но не удалось перевести {failed} из {total} предложений: {error}",
+        "uk": "Книгу збережено, але не вдалося перекласти {failed} із {total} речень: {error}",
+        "en": "Book saved, but {failed} of {total} sentences could not be translated: {error}",
+        "fr": "Livre enregistré, mais {failed} phrases sur {total} n'ont pas pu être traduites : {error}",
+        "es": "Libro guardado, pero no se pudieron traducir {failed} de {total} frases: {error}",
     },
     "marked": {
         "ru": "Запомнено: {words}", "uk": "Запам'ятовано: {words}",
@@ -596,25 +818,186 @@ def erstelle_app_icon():
     return QIcon(pixmap)
 
 
-def bild_pfad(wort_lower):
+def erstelle_aktions_icon(art, aktiv=True):
+    """Kachel im Stil des App-Icons für Export, Synchronisierung und Aktualisierung."""
+    pixmap = QPixmap(128, 128)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pixmap)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    hintergrund = QPainterPath()
+    hintergrund.addRoundedRect(4, 4, 120, 120, 28, 28)
+    farbverlauf = QLinearGradient(4, 4, 124, 124)
+    if aktiv:
+        farbverlauf.setColorAt(0, QColor("#9a7bff"))
+        farbverlauf.setColorAt(1, QColor("#6242df"))
+    else:
+        farbverlauf.setColorAt(0, QColor("#4a4d5c"))
+        farbverlauf.setColorAt(1, QColor("#363846"))
+    p.fillPath(hintergrund, farbverlauf)
+
+    p.setPen(QPen(QColor("#ffffff" if aktiv else "#8a8d9c"), 8,
+                  Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                  Qt.PenJoinStyle.RoundJoin))
+    if art == "export":
+        buch = QPainterPath()
+        buch.moveTo(30, 66)
+        buch.lineTo(30, 98)
+        buch.cubicTo(44, 93, 55, 94, 64, 102)
+        buch.cubicTo(73, 94, 84, 93, 98, 98)
+        buch.lineTo(98, 66)
+        p.drawPath(buch)
+        p.drawLine(64, 76, 64, 100)
+        p.drawLine(64, 74, 64, 26)
+        p.drawLine(64, 26, 46, 44)
+        p.drawLine(64, 26, 82, 44)
+    elif art == "refresh":
+        rect = QRectF(36, 36, 56, 56)
+        p.drawArc(rect, 45 * 16, 285 * 16)
+        p.drawLine(87, 33, 96, 53)
+        p.drawLine(96, 53, 74, 52)
+    else:
+        rect = QRectF(34, 34, 60, 60)
+        p.drawArc(rect, 20 * 16, 140 * 16)
+        p.drawArc(rect, 200 * 16, 140 * 16)
+        p.drawLine(95, 43, 95, 62)
+        p.drawLine(95, 62, 76, 62)
+        p.drawLine(33, 85, 33, 66)
+        p.drawLine(33, 66, 52, 66)
+    p.end()
+    return QIcon(pixmap)
+
+
+def bild_pfad(wort_lower, bilder_ordnung=BILDER_ORDNER):
     """Dateiname für das Bild eines Wortes (Sonderzeichen werden ersetzt)."""
     sauber = re.sub(r"[^\w\-]", "_", wort_lower)
-    return os.path.join(BILDER_ORDNER, sauber + "_context5.jpg")
+    return os.path.join(bilder_ordnung, sauber + "_context5.jpg")
 
 
-def openverse_bild_pfade(wort_lower):
-    hauptpfad = bild_pfad(wort_lower)
+def openverse_bild_pfade(wort_lower, bilder_ordnung=BILDER_ORDNER):
+    hauptpfad = bild_pfad(wort_lower, bilder_ordnung)
     stamm, endung = os.path.splitext(hauptpfad)
     return [hauptpfad, f"{stamm}_2{endung}", f"{stamm}_3{endung}"]
 
 
-def gemini_bild_pfad(wort_lower):
+def gemini_bild_pfad(wort_lower, bilder_ordnung=BILDER_ORDNER):
     sauber = re.sub(r"[^\w\-]", "_", wort_lower)
-    return os.path.join(BILDER_ORDNER, sauber + "_gemini.png")
+    return os.path.join(bilder_ordnung, sauber + "_gemini.png")
 
 
 def bild_info_pfad(pfad):
     return os.path.splitext(pfad)[0] + ".json"
+
+
+def stbook_pfad_sicher(pfad):
+    return (
+        isinstance(pfad, str)
+        and bool(pfad)
+        and "\\" not in pfad
+        and not pfad.startswith("/")
+        and all(teil not in ("", ".", "..") for teil in pfad.split("/"))
+    )
+
+
+def stbook_auspacken(pfad):
+    digest = hashlib.sha256()
+    with open(pfad, "rb") as datei:
+        for block in iter(lambda: datei.read(1024 * 1024), b""):
+            digest.update(block)
+    zielordner = os.path.join(CACHE_ORDNER, "stbooks", digest.hexdigest())
+    os.makedirs(zielordner, exist_ok=True)
+
+    with zipfile.ZipFile(pfad, "r") as archiv:
+        eintraege = archiv.infolist()
+        namen = [eintrag.filename for eintrag in eintraege]
+        if len(namen) != len(set(namen)) or "metadata.json" not in namen:
+            raise ValueError("Invalid or duplicate archive entries.")
+        eintraege_nach_name = {
+            eintrag.filename: eintrag for eintrag in eintraege
+        }
+        if (
+            eintraege_nach_name["metadata.json"].file_size > 64 * 1024 * 1024
+            or sum(
+                eintraege_nach_name[name].file_size
+                for name in namen
+                if name != "metadata.json"
+            ) > 10 * 1024 * 1024 * 1024
+        ):
+            raise ValueError("The book archive exceeds the supported size.")
+        try:
+            metadaten = json.loads(archiv.read("metadata.json").decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("The metadata file is invalid UTF-8 JSON.") from error
+        if (
+            not isinstance(metadaten, dict)
+            or metadaten.get("format") != "Sprachtrainer Book"
+            or metadaten.get("version") != STBOOK_VERSION
+        ):
+            raise ValueError("Unsupported .stbook format version.")
+
+        audio_name = metadaten.get("audio")
+        assets = metadaten.get("assets")
+        segmente = metadaten.get("segments")
+        uebersetzungen = metadaten.get("translations", [])
+        if (
+            not stbook_pfad_sicher(audio_name)
+            or not audio_name.startswith("audio/")
+            or len(audio_name.split("/")) != 2
+            or os.path.splitext(audio_name)[1].lower()
+            not in {".mp3", ".wav", ".m4a", ".ogg", ".aif", ".aiff"}
+            or audio_name not in namen
+        ):
+            raise ValueError("The book's audio file is missing or invalid.")
+        if not isinstance(assets, list) or not isinstance(segmente, list) or not segmente:
+            raise ValueError("The book contains no valid sentence data.")
+        if not isinstance(uebersetzungen, list):
+            raise ValueError("The translations list is invalid.")
+        if any(
+            not stbook_pfad_sicher(asset)
+            or not asset.startswith("bilder/")
+            or len(asset.split("/")) != 2
+            or asset not in namen
+            for asset in assets
+        ):
+            raise ValueError("The book contains an invalid image path.")
+        for segment in segmente:
+            if (
+                not isinstance(segment, dict)
+                or not isinstance(segment.get("start"), (int, float))
+                or not isinstance(segment.get("ende"), (int, float))
+                or not math.isfinite(segment["start"])
+                or not math.isfinite(segment["ende"])
+                or segment["start"] < 0
+                or segment["ende"] < segment["start"]
+                or not isinstance(segment.get("tokens"), list)
+                or not segment["tokens"]
+                or any(
+                    not isinstance(token, dict)
+                    or not isinstance(token.get("roh"), str)
+                    or not isinstance(token.get("rein"), str)
+                    for token in segment["tokens"]
+                )
+            ):
+                raise ValueError("The book contains invalid sentence timing or tokens.")
+        for uebersetzung in uebersetzungen:
+            if (
+                not isinstance(uebersetzung, dict)
+                or not all(
+                    isinstance(uebersetzung.get(feld), str)
+                    for feld in ("original", "language", "text")
+                )
+            ):
+                raise ValueError("The book contains an invalid translation entry.")
+
+        for archivpfad in (audio_name, *assets):
+            zielpfad = os.path.join(zielordner, *archivpfad.split("/"))
+            os.makedirs(os.path.dirname(zielpfad), exist_ok=True)
+            with archiv.open(archivpfad) as quelle, open(zielpfad, "wb") as ziel:
+                shutil.copyfileobj(quelle, ziel)
+
+    return metadaten, os.path.join(zielordner, *audio_name.split("/")), os.path.join(
+        zielordner, "bilder"
+    )
 
 
 def bild_wort_muster(wort):
@@ -673,6 +1056,55 @@ def ist_wort(text):
     return bool(text) and any(c.isalpha() for c in text)
 
 
+def stbook_hat_wortzeiten(metadaten):
+    return any(
+        token.get("rein")
+        and isinstance(token.get("start"), (int, float))
+        and isinstance(token.get("ende"), (int, float))
+        for segment in metadaten.get("segments", [])
+        for token in segment.get("tokens", [])
+    )
+
+
+def aktualisiere_stbook_timing_flag(pfad):
+    """Promote legacy exports with usable partial word timing metadata."""
+    with zipfile.ZipFile(pfad) as archiv:
+        metadaten = json.loads(archiv.read("metadata.json"))
+        if (
+            metadaten.get("word_timestamps") is True
+            or not stbook_hat_wortzeiten(metadaten)
+        ):
+            return None
+        metadaten["word_timestamps"] = True
+        fd, temporaer = tempfile.mkstemp(
+            prefix="timing-flag-", suffix=".stbook", dir=os.path.dirname(pfad)
+        )
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(temporaer, "w") as aktualisiert:
+                for eintrag in archiv.infolist():
+                    if eintrag.filename == "metadata.json":
+                        aktualisiert.writestr(
+                            eintrag,
+                            json.dumps(
+                                metadaten, ensure_ascii=False, indent=2
+                            ).encode("utf-8"),
+                        )
+                    else:
+                        with (
+                            archiv.open(eintrag) as quelle,
+                            aktualisiert.open(eintrag, "w") as ziel,
+                        ):
+                            shutil.copyfileobj(quelle, ziel, length=1024 * 1024)
+        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile):
+            if os.path.exists(temporaer):
+                os.unlink(temporaer)
+            raise
+    with open(temporaer, "rb") as datei:
+        neue_id = hashlib.file_digest(datei, "sha256").hexdigest()
+    return temporaer, neue_id
+
+
 def gemini_interaction(prompt, modell, timeout=60):
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -699,15 +1131,39 @@ def gemini_interaction(prompt, modell, timeout=60):
 
 
 def gemini_output_text(ergebnis):
+    if not isinstance(ergebnis, dict):
+        raise RuntimeError("Gemini returned an invalid response.")
     text = ergebnis.get("output_text")
     if isinstance(text, str) and text.strip():
         return text.strip()
-    for ausgabe in ergebnis.get("output", []):
+    ausgaben = ergebnis.get("output", [])
+    if not isinstance(ausgaben, list):
+        raise RuntimeError("Gemini returned an invalid text response.")
+    for ausgabe in ausgaben:
         if not isinstance(ausgabe, dict):
             continue
         if ausgabe.get("type") == "text" and ausgabe.get("text"):
             return str(ausgabe["text"]).strip()
     raise RuntimeError("Gemini returned no text.")
+
+
+def gemini_interaction_mit_fallback(prompt, timeout=60):
+    try:
+        ergebnis = gemini_interaction(prompt, GEMINI_TEXT_MODEL, timeout)
+        gemini_output_text(ergebnis)
+        return ergebnis
+    except (RuntimeError, OSError, ValueError) as primary_error:
+        try:
+            ergebnis = gemini_interaction(
+                prompt, GEMINI_TEXT_FALLBACK_MODEL, timeout
+            )
+            gemini_output_text(ergebnis)
+            return ergebnis
+        except (RuntimeError, OSError, ValueError) as fallback_error:
+            raise RuntimeError(
+                f"{GEMINI_TEXT_MODEL} failed: {primary_error}; "
+                f"{GEMINI_TEXT_FALLBACK_MODEL} fallback failed: {fallback_error}"
+            ) from fallback_error
 
 
 def gemini_bild_suchdaten(wort, kontext):
@@ -722,32 +1178,40 @@ def gemini_bild_suchdaten(wort, kontext):
         "context clues). Do not include explanations.\n"
         f"German target: {wort}\nGerman sentence context: {kontext}"
     )
-    text = gemini_output_text(
-        gemini_interaction(prompt, "gemini-3.8-flash", timeout=30)
-    )
-    start = text.find("{")
-    ende = text.rfind("}")
-    if start < 0 or ende < start:
-        raise ValueError("Gemini returned no JSON image-search terms.")
-    daten = json.loads(text[start:ende + 1])
-    query = daten.get("query")
-    zielwoerter = daten.get("target_terms")
-    kontextwoerter = daten.get("context_terms")
-    if (not isinstance(query, str) or not query.strip()
-            or not isinstance(zielwoerter, list)
-            or not isinstance(kontextwoerter, list)):
-        raise ValueError("Gemini returned invalid image-search terms.")
-    zielwoerter = [
-        eintrag.strip()[:80] for eintrag in zielwoerter
-        if isinstance(eintrag, str) and eintrag.strip()
-    ][:5]
-    kontextwoerter = [
-        eintrag.strip()[:80] for eintrag in kontextwoerter
-        if isinstance(eintrag, str) and eintrag.strip()
-    ][:6]
-    if not zielwoerter:
-        raise ValueError("Gemini returned no target search terms.")
-    return query.strip()[:180], zielwoerter, kontextwoerter
+    fehler = []
+    for modell in (GEMINI_TEXT_MODEL, GEMINI_TEXT_FALLBACK_MODEL):
+        try:
+            text = gemini_output_text(
+                gemini_interaction(prompt, modell, timeout=30)
+            )
+            start = text.find("{")
+            ende = text.rfind("}")
+            if start < 0 or ende < start:
+                raise ValueError("Gemini returned no JSON image-search terms.")
+            daten = json.loads(text[start:ende + 1])
+            if not isinstance(daten, dict):
+                raise ValueError("Gemini returned invalid image-search terms.")
+            query = daten.get("query")
+            zielwoerter = daten.get("target_terms")
+            kontextwoerter = daten.get("context_terms")
+            if (not isinstance(query, str) or not query.strip()
+                    or not isinstance(zielwoerter, list)
+                    or not isinstance(kontextwoerter, list)):
+                raise ValueError("Gemini returned invalid image-search terms.")
+            zielwoerter = [
+                eintrag.strip()[:80] for eintrag in zielwoerter
+                if isinstance(eintrag, str) and eintrag.strip()
+            ][:5]
+            kontextwoerter = [
+                eintrag.strip()[:80] for eintrag in kontextwoerter
+                if isinstance(eintrag, str) and eintrag.strip()
+            ][:6]
+            if not zielwoerter:
+                raise ValueError("Gemini returned no target search terms.")
+            return query.strip()[:180], zielwoerter, kontextwoerter
+        except (RuntimeError, OSError, ValueError) as error:
+            fehler.append(f"{modell}: {error}")
+    raise RuntimeError("; ".join(fehler))
 
 
 # --------------------------------------------------------------------------- #
@@ -756,15 +1220,20 @@ def gemini_bild_suchdaten(wort, kontext):
 class AnalyseThread(QThread):
     analyse_beendet = pyqtSignal(object)
     status_update = pyqtSignal(str)
+    fortschritt = pyqtSignal(float, float, float)
 
-    def __init__(self, mp3_pfad, modell_name):
+    def __init__(self, mp3_pfad, modell_name, force_reanalyse=False):
         super().__init__()
         self.mp3_pfad = mp3_pfad
         self.modell_name = modell_name
+        self.force_reanalyse = force_reanalyse
 
     def cache_pfad(self):
         st = os.stat(self.mp3_pfad)
-        schluessel = f"{os.path.abspath(self.mp3_pfad)}|{st.st_mtime_ns}|{self.modell_name}_segments"
+        schluessel = (
+            f"{os.path.abspath(self.mp3_pfad)}|{st.st_mtime_ns}|"
+            f"{self.modell_name}_word_segments"
+        )
         h = hashlib.md5(schluessel.encode("utf-8")).hexdigest()
         return os.path.join(CACHE_ORDNER, h + ".json")
 
@@ -775,7 +1244,7 @@ class AnalyseThread(QThread):
             cache = self.cache_pfad()
 
             daten = None
-            if os.path.exists(cache):
+            if not self.force_reanalyse and os.path.exists(cache):
                 try:
                     with open(cache, "r", encoding="utf-8") as f:
                         daten = json.load(f)
@@ -787,6 +1256,7 @@ class AnalyseThread(QThread):
                 self.status_update.emit("Transkript aus dem Cache geladen.")
             else:
                 daten = self.transkribiere()
+                self.status_update.emit("Transkript wird gespeichert...")
                 with open(cache, "w", encoding="utf-8") as f:
                     json.dump(daten, f, ensure_ascii=False)
 
@@ -810,13 +1280,45 @@ class AnalyseThread(QThread):
 
         self.status_update.emit(f"Whisper-Modell wird geladen ({self.modell_name})...")
         modell = whisper.load_model(self.modell_name)
-        self.status_update.emit("Audio wird nach Sätzen analysiert (bitte warten)...")
-        ergebnis = modell.transcribe(
-            self.mp3_pfad,
-            word_timestamps=False,  # schneller, es reicht die Satzebene
-            language="de",
-            fp16=modell.device.type != "cpu",
+        self.status_update.emit(
+            "Audio wird nach Sätzen und Wörtern analysiert (bitte warten)..."
         )
+        thread = self
+        start_zeit = time.monotonic()
+
+        class FortschrittsBalken:
+            def __init__(self, *args, total=None, **kwargs):
+                self.total = float(total or 0)
+                self.fertig = 0.0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def update(self, n=1):
+                self.fertig += n
+                if self.total > 0:
+                    # Whisper zählt Mel-Frames: 100 pro Sekunde Audio
+                    thread.fortschritt.emit(
+                        self.fertig / 100.0, self.total / 100.0,
+                        time.monotonic() - start_zeit,
+                    )
+
+        transkribier_modul = sys.modules["whisper.transcribe"]
+        original_tqdm = transkribier_modul.tqdm
+        transkribier_modul.tqdm = types.SimpleNamespace(tqdm=FortschrittsBalken)
+        try:
+            ergebnis = modell.transcribe(
+                self.mp3_pfad,
+                word_timestamps=True,
+                language="de",
+                fp16=modell.device.type != "cpu",
+                verbose=False,
+            )
+        finally:
+            transkribier_modul.tqdm = original_tqdm
 
         segmente = []
         for segment in ergebnis.get("segments", []):
@@ -828,7 +1330,16 @@ class AnalyseThread(QThread):
                 if token == "":
                     continue
                 tokens.append({"roh": token, "rein": token.strip(SATZZEICHEN)})
-            segmente.append({"start": segment["start"], "ende": segment["end"], "tokens": tokens})
+            start = segment["start"]
+            ende = segment["end"]
+            wortzeiten = wortzeitstempel_fuer_tokens(
+                tokens, segment.get("words"), start, ende
+            )
+            if wortzeiten is not None:
+                for token_index, wort_start, wort_ende in wortzeiten:
+                    tokens[token_index]["start"] = wort_start
+                    tokens[token_index]["ende"] = wort_ende
+            segmente.append({"start": start, "ende": ende, "tokens": tokens})
         return {"segmente": segmente}
 
 
@@ -1005,7 +1516,7 @@ class UebersetzungThread(QThread):
                 f"German sentence: {self.text}"
             )
             try:
-                daten = gemini_interaction(prompt, "gemini-3.8-flash", timeout=30)
+                daten = gemini_interaction_mit_fallback(prompt, timeout=30)
                 uebersetzung = gemini_output_text(daten)
                 self.fertig.emit(self.text, self.zielsprache, uebersetzung, "")
             except Exception as gemini_error:
@@ -1294,40 +1805,55 @@ class GeminiBildThread(QThread):
         self.pfad = pfad
 
     def run(self):
+        prompt = (
+            "Create one clear, simple educational illustration for a German "
+            "vocabulary learner. Show the concrete meaning of the German "
+            f"word “{self.wort}” in this sentence context: “{self.kontext}”. "
+            "Make the target concept visually obvious, use one central subject "
+            "and a clean background, square composition, no captions, no letters, "
+            "no labels, and no collage."
+        )
+        fehler = []
+        bild = None
+        for modell in (GEMINI_IMAGE_MODEL, GEMINI_IMAGE_FALLBACK_MODEL):
+            try:
+                ergebnis = gemini_interaction(prompt, modell, timeout=60)
+                if not isinstance(ergebnis, dict):
+                    raise RuntimeError("Gemini returned an invalid image response.")
+                bilddaten = ergebnis.get("output_image")
+                kodiert = (
+                    bilddaten.get("data") if isinstance(bilddaten, dict) else None
+                )
+                if not kodiert:
+                    for ausgabe in ergebnis.get("output", []):
+                        if isinstance(ausgabe, dict) and ausgabe.get("type") == "image":
+                            kodiert = ausgabe.get("data")
+                            if kodiert:
+                                break
+                if not kodiert:
+                    raise RuntimeError("Gemini returned no image data.")
+                bild = QImage.fromData(
+                    base64.b64decode(kodiert, validate=True)
+                )
+                if bild.isNull():
+                    raise RuntimeError("Gemini returned an invalid image.")
+                break
+            except (
+                RuntimeError, OSError, ValueError, binascii.Error
+            ) as error:
+                fehler.append(f"{modell}: {error}")
+
+        if bild is None:
+            self.fertig.emit(self.wort_lower, False, "; ".join(fehler))
+            return
         try:
-            prompt = (
-                "Create one clear, simple educational illustration for a German "
-                "vocabulary learner. Show the concrete meaning of the German "
-                f"word “{self.wort}” in this sentence context: “{self.kontext}”. "
-                "Make the target concept visually obvious, use one central subject "
-                "and a clean background, square composition, no captions, no letters, "
-                "no labels, and no collage."
-            )
-            ergebnis = gemini_interaction(
-                prompt, "gemini-3.1-flash-lite-image", timeout=60
-            )
-            bilddaten = ergebnis.get("output_image")
-            if isinstance(bilddaten, dict):
-                kodiert = bilddaten.get("data")
-            else:
-                kodiert = None
-            if not kodiert:
-                for ausgabe in ergebnis.get("output", []):
-                    if isinstance(ausgabe, dict) and ausgabe.get("type") == "image":
-                        kodiert = ausgabe.get("data")
-                        if kodiert:
-                            break
-            if not kodiert:
-                raise RuntimeError("Gemini returned no image data.")
-            bild = QImage.fromData(base64.b64decode(kodiert, validate=True))
-            if bild.isNull():
-                raise RuntimeError("Gemini returned an invalid image.")
             os.makedirs(os.path.dirname(self.pfad), exist_ok=True)
             if not bild.save(self.pfad, "PNG"):
                 raise OSError(f"Could not save generated image to {self.pfad}.")
-            self.fertig.emit(self.wort_lower, True, "")
-        except Exception as error:
+        except OSError as error:
             self.fertig.emit(self.wort_lower, False, str(error))
+            return
+        self.fertig.emit(self.wort_lower, True, "")
 
 
 # --------------------------------------------------------------------------- #
@@ -1471,6 +1997,7 @@ STYLE = """
 * { color: #e8eaf2; }
 QMainWindow, QWidget#root { background: #12141c; }
 QLabel { background: transparent; }
+QMessageBox, QDialog { background: #181b26; }
 QToolTip {
     color: #111111;
     background-color: #f5f5f5;
@@ -1491,6 +2018,33 @@ QPushButton {
 QPushButton:hover { background: #2c3148; }
 QPushButton:pressed { background: #1d2031; }
 QPushButton:disabled { color: #50546b; background: #1a1d2a; }
+QToolButton {
+    color: #ffffff; background: #7c5cff; border: none; border-radius: 12px;
+    padding: 11px 20px; font-size: 14px; font-weight: 600;
+}
+QToolButton:hover { background: #8f73ff; }
+QToolButton:pressed { background: #6848e8; }
+QToolButton:disabled { color: #77718f; background: #30294a; }
+QToolButton::menu-button {
+    background: transparent; border: none; border-left: 1px solid #a998ff;
+    border-top-right-radius: 12px; border-bottom-right-radius: 12px;
+    width: 14px;
+}
+QToolButton::menu-button:hover { background: #8f73ff; }
+QToolButton#refresh {
+    color: #ffffff; background: transparent; border-radius: 12px;
+    padding: 0; border: none;
+}
+QToolButton#refresh:hover { background: #2c3148; }
+QToolButton#refresh:pressed { background: #1d2031; }
+QToolButton#refresh:disabled { color: #50546b; background: transparent; }
+QToolButton#refresh::menu-button {
+    width: 10px; padding: 0; border: none; background: transparent;
+}
+QToolButton#refresh::menu-button:hover { background: #2c3148; }
+QMenu { color: #e8eaf2; background: #232738; border: 1px solid #3b4058; }
+QMenu::item { padding: 7px 24px; }
+QMenu::item:selected { color: #ffffff; background: #7c5cff; }
 QPushButton#primary { background: #7c5cff; }
 QPushButton#primary:hover { background: #8f73ff; }
 QPushButton#primary:disabled { background: #2d2750; color: #6a6490; }
@@ -1538,7 +2092,31 @@ class SprachLernPlayer(QMainWindow):
 
         self.bekannte_woerter = set()
         self.rueckgaengig_stack = []  # Liste von Gruppen (Listen von Wörtern)
+        self.sync_server = SyncServerThread(
+            os.path.join(CACHE_ORDNER, "sync_state.json"),
+            os.path.join(CACHE_ORDNER, "sync_books"),
+        )
+        self.sync_word_snapshot = set()
+        self.bereinige_sync_buecher()
         self.lade_woerterbuch()
+        self.sync_word_state = self.sync_server.store.public_state()["words"]
+        for wort in self.bekannte_woerter:
+            self.sync_word_state.setdefault(
+                wort, {"known": True, "updated_at": 0}
+            )
+        initial_state = self.sync_server.store.merge({
+            "version": 1,
+            "words": self.sync_word_state,
+            "progress": {},
+        })
+        self.sync_word_state = initial_state["words"]
+        self.bekannte_woerter = {
+            wort for wort, eintrag in self.sync_word_state.items()
+            if eintrag.get("known") is True
+        }
+        self.sync_word_snapshot = set(self.bekannte_woerter)
+        self._sync_book_digest_cache = None
+        self._sync_last_position = None
 
         self.segmente = []
         self.starts = []
@@ -1552,6 +2130,8 @@ class SprachLernPlayer(QMainWindow):
         self.ausgewaehltes_bekanntes_wort = None
         self.mp3_pfad = None
         self.quell_pfad = None
+        self.bilder_ordnung_aktuell = BILDER_ORDNER
+        self.stbook_aktiv = False
         self.analyse_thread = None
         self.text_audio_thread = None
         self.aktive_threads = set()
@@ -1575,6 +2155,7 @@ class SprachLernPlayer(QMainWindow):
         self.uebersetzungen = {}
         self.uebersetzung_fehler = {}
         self.uebersetzung_threads = {}
+        self.translation_batch = None
         self.aktuelle_uebersetzung = None
         self.status_key = "initial_status"
         self.status_args = {}
@@ -1599,6 +2180,16 @@ class SprachLernPlayer(QMainWindow):
         self.speicher_timer.setInterval(2000)
         self.speicher_timer.timeout.connect(self.speichere_wiedergabestand)
         self.speicher_timer.start()
+        self.sync_server.ready.connect(self.sync_server_bereit)
+        self.sync_server.failed.connect(self.sync_server_fehler)
+        self.sync_server.pairing_code_changed.connect(
+            lambda _: self.status_label.setToolTip(
+                "The pairing code changed; reopen Sync with Android to see it."
+            )
+        )
+        self.sync_server.state_received.connect(self.sync_zustand_empfangen)
+        self.sync_server.book_received.connect(self.sync_buch_empfangen)
+        self.starte_thread(self.sync_server)
         QTimer.singleShot(0, self.wiederherstelle_wiedergabe)
 
     # ------------------------------ UI -------------------------------------- #
@@ -1722,6 +2313,43 @@ class SprachLernPlayer(QMainWindow):
         btns.setSpacing(10)
         self.btn_laden = QPushButton()
         self.btn_laden.clicked.connect(self.lade_datei)
+        self.btn_reanalyse = QToolButton()
+        self.btn_reanalyse.setObjectName("refresh")
+        self.btn_reanalyse.clicked.connect(self.erzwinge_neuanalyse)
+        self.btn_reanalyse.setEnabled(False)
+        refresh_icon = QIcon()
+        refresh_icon.addPixmap(
+            erstelle_aktions_icon("refresh").pixmap(128, 128),
+            QIcon.Mode.Normal,
+        )
+        refresh_icon.addPixmap(
+            erstelle_aktions_icon("refresh", False).pixmap(128, 128),
+            QIcon.Mode.Disabled,
+        )
+        self.btn_reanalyse.setIcon(refresh_icon)
+        self.btn_reanalyse.setIconSize(QSize(36, 36))
+        self.btn_reanalyse.setAutoRaise(True)
+        self.refresh_menu = QMenu(self.btn_reanalyse)
+        self.action_refresh_translations = self.refresh_menu.addAction("")
+        self.action_refresh_translations.triggered.connect(
+            self.wiederhole_fehlende_uebersetzungen
+        )
+        self.action_refresh_speech = self.refresh_menu.addAction("")
+        self.action_refresh_speech.triggered.connect(
+            self.erzwinge_spracherkennung
+        )
+        self.action_refresh_images = self.refresh_menu.addAction("")
+        self.action_refresh_images.triggered.connect(
+            self.wiederhole_bilder_fuer_satz
+        )
+        self.btn_reanalyse.setMenu(self.refresh_menu)
+        self.btn_reanalyse.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup
+        )
+        self.btn_reanalyse.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.btn_export = QPushButton()
+        self.btn_export.clicked.connect(self.exportiere_stbook)
+        self.btn_export.setEnabled(False)
         self.btn_zurueck = QPushButton("⏮")
         self.btn_zurueck.clicked.connect(self.vorheriger_satz)
         self.btn_play = QPushButton()
@@ -1737,8 +2365,11 @@ class SprachLernPlayer(QMainWindow):
         self.btn_skip = QPushButton()
         self.btn_skip.clicked.connect(self.weiter_zum_naechsten_wort)
 
-        alle = (self.btn_laden, self.btn_zurueck, self.btn_play, self.btn_weiter,
-                self.btn_wiederholen, self.btn_gemerkt, self.btn_skip)
+        alle = (
+            self.btn_laden, self.btn_zurueck, self.btn_play,
+            self.btn_weiter, self.btn_wiederholen, self.btn_gemerkt,
+            self.btn_skip,
+        )
         for b in alle:
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             btns.addWidget(b)
@@ -1843,6 +2474,43 @@ class SprachLernPlayer(QMainWindow):
         self.datei_liste.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.datei_liste.setFixedHeight(170)
         self.datei_liste.itemClicked.connect(self.waehle_analysierte_datei)
+        self.datei_liste.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.datei_liste.customContextMenuRequested.connect(
+            self.zeige_dateilisten_menue
+        )
+        self.btn_sync = QPushButton()
+        self.btn_sync.clicked.connect(self.zeige_sync_information)
+        aktionen = QHBoxLayout()
+        aktionen.setSpacing(10)
+        for knopf, art in (
+            (self.btn_export, "export"),
+            (self.btn_sync, "sync"),
+        ):
+            icon = QIcon()
+            icon.addPixmap(erstelle_aktions_icon(art).pixmap(128, 128),
+                           QIcon.Mode.Normal)
+            icon.addPixmap(erstelle_aktions_icon(art, False).pixmap(128, 128),
+                           QIcon.Mode.Disabled)
+            knopf.setIcon(icon)
+            knopf.setIconSize(QSize(36, 36))
+            knopf.setFixedSize(46, 46)
+            knopf.setFlat(True)
+            knopf.setStyleSheet(
+                "QPushButton { background: transparent; padding: 0; border-radius: 12px; }"
+                "QPushButton:hover { background: #2c3148; }"
+            )
+            knopf.setCursor(Qt.CursorShape.PointingHandCursor)
+            knopf.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            aktionen.addWidget(knopf)
+        self.btn_reanalyse.setFixedSize(46, 46)
+        self.btn_reanalyse.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_reanalyse.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_reanalyse.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        aktionen.addWidget(self.btn_reanalyse)
+        aktionen.addStretch(1)
+        sv.addLayout(aktionen)
         sv.addWidget(self.datei_liste)
 
         self.wort_titel = QLabel()
@@ -1895,6 +2563,23 @@ class SprachLernPlayer(QMainWindow):
             self.uebersetzung_threads.pop(key)
         thread.deleteLater()
 
+    def analyse_fortschritt(self, fertig, gesamt, vergangen):
+        if gesamt <= 0:
+            return
+        anteil = min(1.0, fertig / gesamt)
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setValue(int(anteil * 1000))
+        if anteil >= 0.02 and vergangen >= 5:
+            rest = vergangen * (1.0 - anteil) / anteil
+            eta = self.ui_text("analysis_eta", time=format_zeit(rest * 1000))
+        else:
+            eta = self.ui_text("analysis_eta_calculating")
+        self.set_status(
+            "analysis_progress", percent=int(anteil * 100),
+            done=format_zeit(min(fertig, gesamt) * 1000),
+            total=format_zeit(gesamt * 1000), eta=eta,
+        )
+
     def analyse_status_geaendert(self, text):
         if text.startswith("Transkript aus dem Cache"):
             self.set_status("cached_transcript")
@@ -1903,8 +2588,14 @@ class SprachLernPlayer(QMainWindow):
         elif text.startswith("Whisper-Modell wird geladen"):
             modell = text.partition("(")[2].rstrip(")...")
             self.set_status("loading_model", model=modell)
-        elif text.startswith("Audio wird nach Sätzen analysiert"):
-            self.set_status("analyzing_audio")
+        elif text.startswith("Audio wird nach Sätzen"):
+            self.progress_bar.setRange(0, 1000)
+            self.progress_bar.setValue(0)
+            self.set_status("analysis_progress", percent=0, done=format_zeit(0),
+                            total="…", eta=self.ui_text("analysis_eta_calculating"))
+        elif text.startswith("Transkript wird gespeichert"):
+            self.progress_bar.setRange(0, 0)
+            self.set_status("saving_transcript")
         elif text.startswith("Fehler bei der Analyse:"):
             self.set_status("analysis_error", error=text.partition(":")[2].strip())
         else:
@@ -1925,6 +2616,15 @@ class SprachLernPlayer(QMainWindow):
             self.ui_text("translation_word_match_tooltip")
         )
         self.btn_laden.setText(self.ui_text("load_file"))
+        self.btn_reanalyse.setText(self.ui_text("reanalyze"))
+        self.btn_reanalyse.setToolTip(self.ui_text("reanalyze_tooltip"))
+        self.action_refresh_translations.setText(
+            self.ui_text("refresh_translations")
+        )
+        self.action_refresh_speech.setText(self.ui_text("refresh_speech"))
+        self.action_refresh_images.setText(self.ui_text("refresh_images"))
+        self.btn_export.setToolTip(self.ui_text("export_book"))
+        self.btn_sync.setToolTip(self.ui_text("sync_android"))
         self.btn_zurueck.setToolTip(self.ui_text("previous_sentence"))
         self.btn_weiter.setToolTip(self.ui_text("next_sentence"))
         self.btn_wiederholen.setText(self.ui_text("repeat_sentence"))
@@ -2049,9 +2749,192 @@ class SprachLernPlayer(QMainWindow):
                 self.bekannte_woerter.add(zeile.strip().lower())
 
     def schreibe_woerterbuch(self):
+        aktuell = {wort.casefold() for wort in self.bekannte_woerter}
+        timestamp = int(time.time() * 1000)
+        for wort in self.sync_word_snapshot | aktuell:
+            if (wort in self.sync_word_snapshot) != (wort in aktuell):
+                self.sync_word_state[wort] = {
+                    "known": wort in aktuell,
+                    "updated_at": timestamp,
+                }
+            else:
+                self.sync_word_state.setdefault(
+                    wort, {"known": wort in aktuell, "updated_at": 0}
+                )
+        self.sync_word_state = self.sync_server.store.merge({
+            "version": 1,
+            "words": self.sync_word_state,
+            "progress": {},
+        })["words"]
+        self.bekannte_woerter = {
+            wort for wort, eintrag in self.sync_word_state.items()
+            if eintrag.get("known") is True
+        }
+        self.sync_word_snapshot = set(self.bekannte_woerter)
         with open(WOERTERBUCH_DATEI, "w", encoding="utf-8") as f:
             for w in sorted(self.bekannte_woerter):
                 f.write(w + "\n")
+
+    def _sync_book_id(self):
+        if not self.quell_pfad or not self.quell_pfad.lower().endswith(".stbook"):
+            return None
+        try:
+            stat = os.stat(self.quell_pfad)
+        except OSError:
+            return None
+        cache_key = (self.quell_pfad, stat.st_size, stat.st_mtime_ns)
+        if self._sync_book_digest_cache and self._sync_book_digest_cache[0] == cache_key:
+            return self._sync_book_digest_cache[1]
+        digest = hashlib.sha256()
+        try:
+            with open(self.quell_pfad, "rb") as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return None
+        result = digest.hexdigest()
+        self._sync_book_digest_cache = (cache_key, result)
+        return result
+
+    def _sync_book_file(self, source):
+        try:
+            digest = hashlib.sha256()
+            with open(source, "rb") as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            destination_directory = self.sync_server.books_directory
+            os.makedirs(destination_directory, exist_ok=True)
+            destination = os.path.join(
+                destination_directory, digest.hexdigest() + ".stbook"
+            )
+            if os.path.abspath(source) != os.path.abspath(destination):
+                shutil.copy2(source, destination)
+            with zipfile.ZipFile(source) as archive:
+                source_name = json.loads(
+                    archive.read("metadata.json")
+                ).get("source_name")
+            for profile_id in self.sync_server.store.profile_ids():
+                profile_directory = self.sync_server.books_directory_for(
+                    profile_id
+                )
+                profile_directory.mkdir(parents=True, exist_ok=True)
+                for old in profile_directory.glob("*.stbook"):
+                    if old.stem == digest.hexdigest():
+                        continue
+                    try:
+                        with zipfile.ZipFile(old) as archive:
+                            old_name = json.loads(
+                                archive.read("metadata.json")
+                            ).get("source_name")
+                    except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+                        continue
+                    if old_name == source_name:
+                        old.unlink()
+                        self.sync_server.store.mark_book_deleted_all(old.stem)
+                profile_copy = profile_directory / (
+                    digest.hexdigest() + ".stbook"
+                )
+                if os.path.abspath(source) != os.path.abspath(profile_copy):
+                    shutil.copy2(source, profile_copy)
+            self.sync_server.store.unmark_book_deleted(digest.hexdigest())
+            if self.audio_bereit:
+                self.sync_server.store.merge({
+                    "version": 1,
+                    "words": {},
+                    "progress": {
+                        digest.hexdigest(): {
+                            "position_ms": max(0, int(self.player.position())),
+                            "updated_at": int(time.time() * 1000),
+                        }
+                    },
+                })
+            self._sync_book_digest_cache = (
+                (self.quell_pfad, os.path.getsize(self.quell_pfad),
+                 os.stat(self.quell_pfad).st_mtime_ns),
+                digest.hexdigest(),
+            ) if self.quell_pfad and os.path.isfile(self.quell_pfad) else None
+        except OSError as error:
+            self.status_label.setToolTip(f"Book is not available for sync: {error}")
+
+    def sync_buch_empfangen(self, book_id):
+        book_path = os.path.join(
+            self.sync_server.books_directory, book_id + ".stbook"
+        )
+        self.status_label.setToolTip(
+            f"Received synchronized book {book_id[:12]}."
+        )
+
+    def sync_server_bereit(self, status):
+        self.status_label.setToolTip(
+            f"Sync server ready on UDP {DISCOVERY_PORT} / HTTP {HTTP_PORT}."
+        )
+
+    def sync_server_fehler(self, error):
+        self.set_error_status(error)
+
+    def zeige_sync_information(self):
+        try:
+            addresses = sorted({
+                item[4][0]
+                for item in socket.getaddrinfo(
+                    socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM
+                )
+                if not item[4][0].startswith("127.")
+            })
+        except OSError:
+            addresses = []
+        address_text = "\n".join(
+            f"{address}:{HTTP_PORT}" for address in addresses
+        ) or "Use UDP discovery on the same local network."
+        QMessageBox.information(
+            self,
+            "Android synchronization",
+            "On Android, open Sync, discover this computer, and enter the "
+            "one-time pairing code.\n\n"
+            f"Pairing code: {self.sync_server.pair_code}\n"
+            f"Computer addresses:\n{address_text}\n\n"
+            "Keep the code private. It changes after a device is paired and "
+            "expires after 10 minutes.\n"
+            "Use only a trusted private Wi-Fi network; sync traffic is not encrypted.",
+        )
+
+    def sync_zustand_empfangen(self, profile_id, state):
+        if profile_id != "default":
+            return
+        remote_words = state.get("words", {})
+        self.sync_word_state = remote_words
+        self.bekannte_woerter = {
+            wort for wort, eintrag in remote_words.items()
+            if isinstance(eintrag, dict) and eintrag.get("known") is True
+        }
+        self.sync_word_snapshot = set(self.bekannte_woerter)
+        try:
+            with open(WOERTERBUCH_DATEI, "w", encoding="utf-8") as file:
+                for word in sorted(self.bekannte_woerter):
+                    file.write(word + "\n")
+        except OSError as error:
+            self.set_error_status(f"Could not save synced dictionary: {error}")
+        self.nach_aenderung()
+        for book_id, progress in state.get("progress", {}).items():
+            if not isinstance(progress, dict):
+                continue
+            for path in self.sync_server.books_directory.glob(f"{book_id}.stbook"):
+                group = self.wiedergabe_einstellungsgruppe(str(path))
+                position = progress.get("position_ms", 0)
+                self.einstellungen.setValue(
+                    f"{group}/position_ms", position
+                )
+                if self._sync_book_id() == book_id and self.quell_pfad:
+                    active_group = self.wiedergabe_einstellungsgruppe(
+                        self.quell_pfad
+                    )
+                    self.einstellungen.setValue(
+                        f"{active_group}/position_ms", position
+                    )
+                    if self.player.playbackState() != \
+                            QMediaPlayer.PlaybackState.PlayingState:
+                        self.player.setPosition(position)
+        self.einstellungen.sync()
 
     # ------------------------------ Datei ----------------------------------- #
     def lade_datei(self):
@@ -2065,18 +2948,264 @@ class SprachLernPlayer(QMainWindow):
             return
         self.oeffne_datei(pfad)
 
+    def _android_audio(self, audio_pfad):
+        """Android: AIFF wird nicht abgespielt und MP3 lässt sich ohne Index nicht
+        sekundengenau anspringen. Daher wird alles zu M4A (AAC) umgewandelt;
+        die Zeitachse bleibt dieselbe wie bei der Whisper-Analyse (ffmpeg)."""
+        endung = os.path.splitext(audio_pfad)[1].lower()
+        if endung == ".m4a":
+            return audio_pfad
+        if endung in {".aif", ".aiff"}:
+            ziel = os.path.splitext(audio_pfad)[0] + ".m4a"
+        else:
+            os.makedirs(os.path.join(CACHE_ORDNER, "android_audio"), exist_ok=True)
+            schluessel = hashlib.sha256(
+                f"{os.path.abspath(audio_pfad)}|{os.path.getmtime(audio_pfad)}|"
+                f"{os.path.getsize(audio_pfad)}".encode("utf-8")
+            ).hexdigest()
+            ziel = os.path.join(CACHE_ORDNER, "android_audio", schluessel + ".m4a")
+        if (
+            os.path.isfile(ziel)
+            and os.path.getmtime(ziel) >= os.path.getmtime(audio_pfad)
+        ):
+            return ziel
+        ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+        temporaer = ziel + ".tmp.m4a"
+        try:
+            subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-i", audio_pfad,
+                 "-vn", "-map_metadata", "-1", "-ac", "1",
+                 "-c:a", "aac", "-b:a", "64k", temporaer],
+                check=True, capture_output=True, timeout=3600,
+            )
+            os.replace(temporaer, ziel)
+        except (OSError, subprocess.SubprocessError):
+            if os.path.exists(temporaer):
+                os.unlink(temporaer)
+            return audio_pfad
+        return ziel
+
+    def _schreibe_stbook(self, pfad):
+        audio_quelle = self._android_audio(self.mp3_pfad)
+        audio_name = os.path.basename(audio_quelle)
+        audio_typ = os.path.splitext(audio_name)[1].lower()
+        if audio_typ not in {".mp3", ".wav", ".m4a", ".ogg", ".aif", ".aiff"}:
+            raise ValueError(f"Unsupported audio format for .stbook: {audio_typ}")
+        assets = []
+        uebersetzungen = []
+        gesehene_uebersetzungen = set()
+        for segment in self.segmente:
+            original = "".join(
+                token["roh"] for token in segment["tokens"]
+            ).strip()
+            for sprache in ("ru", "uk", "en", "fr", "es"):
+                key = (original, sprache)
+                uebersetzung = self.uebersetzungen.get(key)
+                if not uebersetzung:
+                    cache_key = self.uebersetzung_cache_schluessel(
+                        original, sprache
+                    )
+                    uebersetzung = self.einstellungen.value(
+                        f"translation/cache/{cache_key}", "", type=str
+                    )
+                uebersetzungskennung = (original, sprache)
+                if uebersetzung and uebersetzungskennung not in gesehene_uebersetzungen:
+                    uebersetzungen.append({
+                        "original": original,
+                        "language": sprache,
+                        "text": uebersetzung,
+                    })
+                    gesehene_uebersetzungen.add(uebersetzungskennung)
+
+        woerter = {
+            token["rein"].casefold()
+            for segment in self.segmente
+            for token in segment["tokens"]
+            if ist_wort(token["rein"])
+        }
+        bildquellen = []
+        for wort in sorted(woerter):
+            bildquellen.extend(openverse_bild_pfade(
+                wort, self.bilder_ordnung_aktuell
+            ))
+            bildquellen.append(gemini_bild_pfad(
+                wort, self.bilder_ordnung_aktuell
+            ))
+        audio_dauer_ms = self.player.duration()
+        if audio_dauer_ms <= 0 and self.segmente:
+            audio_dauer_ms = round(
+                max(segment["ende"] for segment in self.segmente) * 1000
+            )
+        wortzeiten_verfuegbar = stbook_hat_wortzeiten({
+            "segments": self.segmente,
+        })
+        with zipfile.ZipFile(pfad, "w") as archiv:
+            archiv.write(
+                audio_quelle,
+                f"audio/{audio_name}",
+                compress_type=zipfile.ZIP_STORED,
+            )
+            for bildpfad in bildquellen:
+                for asset_pfad in (bildpfad, bild_info_pfad(bildpfad)):
+                    if not os.path.isfile(asset_pfad):
+                        continue
+                    asset_name = f"bilder/{os.path.basename(asset_pfad)}"
+                    if asset_name in assets:
+                        continue
+                    archiv.write(
+                        asset_pfad,
+                        asset_name,
+                        compress_type=zipfile.ZIP_STORED,
+                    )
+                    assets.append(asset_name)
+
+            metadaten = {
+                "format": "Sprachtrainer Book",
+                "version": STBOOK_VERSION,
+                "source_name": os.path.basename(self.quell_pfad or audio_name),
+                "audio": f"audio/{audio_name}",
+                "duration_ms": audio_dauer_ms,
+                "word_timestamps": wortzeiten_verfuegbar,
+                "segments": self.segmente,
+                "translations": uebersetzungen,
+                "assets": assets,
+            }
+            archiv.writestr(
+                "metadata.json",
+                json.dumps(metadaten, ensure_ascii=False, indent=2).encode("utf-8"),
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+
+    def veroeffentliche_buch_fuer_sync(self):
+        if (
+            self.stbook_aktiv or not self.segmente or not self.mp3_pfad
+            or not os.path.isfile(self.mp3_pfad) or not self.quell_pfad
+        ):
+            return
+        directory = self.sync_server.books_directory
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix="publish-", suffix=".tmp", dir=directory.parent
+        )
+        os.close(fd)
+        try:
+            self._schreibe_stbook(temporary)
+            source_name = os.path.basename(self.quell_pfad)
+            for old in directory.glob("*.stbook"):
+                try:
+                    with zipfile.ZipFile(old) as archive:
+                        old_name = json.loads(
+                            archive.read("metadata.json")
+                        ).get("source_name")
+                except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+                    continue
+                if old_name == source_name:
+                    old.unlink()
+                    self.sync_server.store.mark_book_deleted_all(old.stem)
+            self._sync_book_file(temporary)
+        except (OSError, ValueError, TypeError, zipfile.BadZipFile) as error:
+            self.status_label.setToolTip(f"Book is not available for sync: {error}")
+        finally:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+    def exportiere_stbook(self):
+        if not self.segmente or not self.mp3_pfad or not os.path.isfile(self.mp3_pfad):
+            return
+        default_name = os.path.splitext(os.path.basename(self.quell_pfad or ""))[0]
+        if not default_name:
+            default_name = "Sprachtrainer"
+        pfad, _ = QFileDialog.getSaveFileName(
+            self,
+            self.ui_text("export_book"),
+            os.path.join(os.path.dirname(self.quell_pfad or ""), default_name + ".stbook"),
+            "Sprachtrainer book (*.stbook)",
+        )
+        if not pfad:
+            return
+        if not pfad.lower().endswith(".stbook"):
+            pfad += ".stbook"
+
+        try:
+            self._schreibe_stbook(pfad)
+        except (OSError, ValueError, TypeError, zipfile.BadZipFile) as error:
+            self.set_error_status(self.ui_text("book_export_error", error=error))
+            return
+        self._sync_book_file(pfad)
+        self.set_status("book_exported", path=os.path.basename(pfad))
+
+    def lade_stbook(self, pfad, automatisch_starten=False):
+        try:
+            metadaten, audio_pfad, bilder_ordnung = stbook_auspacken(pfad)
+        except (OSError, ValueError, zipfile.BadZipFile, KeyError) as error:
+            self.btn_laden.setEnabled(True)
+            self.set_error_status(self.ui_text("book_open_error", error=error))
+            return
+
+        self._cancel_translation_batch()
+        self.stbook_aktiv = True
+        self.bilder_ordnung_aktuell = bilder_ordnung
+        self.stimmen_widget.hide()
+        self.quell_pfad = os.path.abspath(pfad)
+        self._sync_book_file(pfad)
+        book_id = self._sync_book_id()
+        self.mp3_pfad = os.path.abspath(audio_pfad)
+        self.aktuell_modell_name = self.combo_modell.currentText()
+        gruppe = self.wiedergabe_einstellungsgruppe(self.quell_pfad)
+        self.position_beim_wiederherstellen = max(
+            0, self.einstellungen.value(f"{gruppe}/position_ms", 0, type=int)
+        )
+        progress = self.sync_server.store.public_state()["progress"].get(book_id)
+        if progress:
+            self.position_beim_wiederherstellen = progress["position_ms"]
+        self.automatisch_starten = automatisch_starten
+        self.audio_bereit = False
+        self.einstellungen.setValue("playback/last_file", self.quell_pfad)
+        self.einstellungen.sync()
+
+        for eintrag in metadaten["translations"]:
+            key = (eintrag["original"], eintrag["language"])
+            self.uebersetzungen[key] = eintrag["text"]
+            cache_key = self.uebersetzung_cache_schluessel(*key)
+            self.einstellungen.setValue(
+                f"translation/cache/{cache_key}", eintrag["text"]
+            )
+        self.einstellungen.sync()
+
+        self.progress_bar.hide()
+        self.btn_laden.setEnabled(True)
+        self.registriere_analysierte_datei(self.quell_pfad)
+        self.setze_daten(metadaten["segments"])
+        self.player.setSource(QUrl.fromLocalFile(self.mp3_pfad))
+        self.player.setPlaybackRate(self.combo_tempo.currentData())
+        self.setze_bedienung(True)
+        self.zeige_platzhalter(self.ui_text("press_play"), key="press_play")
+        if self.player.mediaStatus() == QMediaPlayer.MediaStatus.LoadedMedia:
+            self.medienstatus_geaendert(self.player.mediaStatus())
+
     def oeffne_datei(self, pfad):
         if self.progress_bar.isVisible():
             return  # es läuft bereits eine Analyse / Sprachsynthese
         pfad = os.path.abspath(pfad)
         self.speichere_wiedergabestand()
+        self.veroeffentliche_buch_fuer_sync()
         # Stop setzt die Position auf 0 -> danach darf nichts mehr gespeichert werden
         self.audio_bereit = False
         self.player.stop()
-        if os.path.splitext(pfad)[1].lower() == ".txt":
+        erweiterung = os.path.splitext(pfad)[1].lower()
+        if erweiterung == ".stbook":
+            self.setze_bedienung(False)
+            self.lade_stbook(pfad)
+        elif erweiterung == ".txt":
+            self.stbook_aktiv = False
+            self.bilder_ordnung_aktuell = BILDER_ORDNER
             self.stimmen_widget.show()
             self.lade_text_datei(pfad)
         else:
+            self.stbook_aktiv = False
+            self.bilder_ordnung_aktuell = BILDER_ORDNER
             self.stimmen_widget.hide()
             self.lade_audio_pfad(pfad)
 
@@ -2103,6 +3232,152 @@ class SprachLernPlayer(QMainWindow):
         self.einstellungen.sync()
         self.aktualisiere_dateiliste()
 
+    def zeige_dateilisten_menue(self, punkt):
+        item = self.datei_liste.itemAt(punkt)
+        if item is None:
+            return
+        menue = QMenu(self)
+        aktion = menue.addAction(self.ui_text("remove_book"))
+        if menue.exec(self.datei_liste.viewport().mapToGlobal(punkt)) is aktion:
+            self.entferne_datei_aus_liste(item.data(Qt.ItemDataRole.UserRole))
+
+    def bereinige_sync_buecher(self):
+        """Behält pro Quelle nur die neueste Buchversion im Sync-Ordner."""
+        verzeichnisse = [
+            self.sync_server.books_directory_for(profile_id)
+            for profile_id in self.sync_server.store.profile_ids()
+        ]
+        self.migriere_wortzeiten_in_sync_buechern(verzeichnisse)
+        for verzeichnis in verzeichnisse:
+            gruppen = {}
+            for kopie in verzeichnis.glob("*.stbook"):
+                try:
+                    with zipfile.ZipFile(kopie) as archiv:
+                        meta = json.loads(archiv.read("metadata.json"))
+                    rang = (
+                        meta.get("word_timestamps") is True,
+                        kopie.stat().st_mtime_ns,
+                    )
+                except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+                    continue
+                gruppen.setdefault(meta.get("source_name"), []).append((rang, kopie))
+            for versionen in gruppen.values():
+                versionen.sort(key=lambda eintrag: eintrag[0], reverse=True)
+                for _, alt in versionen[1:]:
+                    try:
+                        alt.unlink()
+                        self.sync_server.store.mark_book_deleted_all(alt.stem)
+                    except OSError:
+                        pass
+
+    def migriere_wortzeiten_in_sync_buechern(self, verzeichnisse):
+        for verzeichnis in verzeichnisse:
+            for buch in verzeichnis.glob("*.stbook"):
+                temporaer = None
+                try:
+                    result = aktualisiere_stbook_timing_flag(str(buch))
+                    if result is None:
+                        continue
+                    temporaer, neue_id = result
+                    ziel = verzeichnis / f"{neue_id}.stbook"
+                    if ziel.exists():
+                        os.unlink(temporaer)
+                    else:
+                        os.replace(temporaer, ziel)
+                    temporaer = None
+                    alte_id = buch.stem
+                    if alte_id != neue_id:
+                        buch.unlink()
+                        self.sync_server.store.mark_book_deleted_all(alte_id)
+                    self.sync_server.store.unmark_book_deleted(neue_id)
+                except (
+                    OSError, ValueError, KeyError, zipfile.BadZipFile,
+                    TypeError,
+                ) as error:
+                    self.set_error_status(
+                        f"Could not migrate word timings in {buch.name}: {error}"
+                    )
+                finally:
+                    if temporaer and os.path.exists(temporaer):
+                        os.unlink(temporaer)
+
+    def entferne_buch_aus_sync(self, pfad):
+        """Löscht die Sync-Kopie und markiert das Buch für die Handys als gelöscht."""
+        verzeichnisse = [
+            self.sync_server.books_directory_for(profile_id)
+            for profile_id in self.sync_server.store.profile_ids()
+        ]
+        ids = set()
+        if pfad.lower().endswith(".stbook") and os.path.isfile(pfad):
+            try:
+                with open(pfad, "rb") as datei:
+                    ids.add(hashlib.file_digest(datei, "sha256").hexdigest())
+            except OSError:
+                pass
+        name = os.path.basename(pfad)
+        for verzeichnis in verzeichnisse:
+            for kopie in verzeichnis.glob("*.stbook"):
+                try:
+                    with zipfile.ZipFile(kopie) as archiv:
+                        quelle = json.loads(
+                            archiv.read("metadata.json")
+                        ).get("source_name")
+                except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+                    continue
+                if quelle == name:
+                    ids.add(kopie.stem)
+        for buch_id in ids:
+            for verzeichnis in verzeichnisse:
+                try:
+                    (verzeichnis / f"{buch_id}.stbook").unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self.sync_server.store.mark_book_deleted_all(buch_id)
+
+    def entferne_datei_aus_liste(self, pfad):
+        pfad = os.path.abspath(pfad)
+        antwort = QMessageBox.question(
+            self,
+            self.ui_text("remove_book"),
+            self.ui_text("remove_book_confirm", name=os.path.basename(pfad)),
+        )
+        if antwort != QMessageBox.StandardButton.Yes:
+            return
+        normiert = os.path.normcase(pfad)
+        if normiert == os.path.normcase(os.path.abspath(self.quell_pfad or "")):
+            self.player.stop()
+            self.player.setSource(QUrl())
+            self.mp3_pfad = None
+            self.quell_pfad = None
+            self.audio_bereit = False
+            self.setze_daten([])
+            self.leere_bilder()
+            self.setze_bedienung(False)
+            self.zeige_platzhalter(self.ui_text("press_play"), key="press_play")
+        dateien = [
+            eintrag for eintrag in self.einstellungen.value(
+                "playback/recent_files", []
+            ) or [] if os.path.normcase(os.path.abspath(eintrag)) != normiert
+        ] if not isinstance(
+            self.einstellungen.value("playback/recent_files", []), str
+        ) else []
+        self.einstellungen.setValue("playback/recent_files", dateien)
+        self.einstellungen.remove(self.wiedergabe_einstellungsgruppe(pfad))
+        for schluessel in ("playback/last_file", "playback/file"):
+            gespeichert = self.einstellungen.value(schluessel, "", type=str)
+            if gespeichert and os.path.normcase(
+                os.path.abspath(gespeichert)
+            ) == normiert:
+                self.einstellungen.remove(schluessel)
+        self.einstellungen.sync()
+        self.entferne_buch_aus_sync(pfad)
+        self.aktualisiere_dateiliste()
+
+    @staticmethod
+    def liegt_im_cache(pfad):
+        cache = os.path.normcase(os.path.abspath(CACHE_ORDNER)) + os.sep
+        return os.path.normcase(os.path.abspath(pfad)).startswith(cache)
+
     def analysierte_dateien(self):
         dateien = self.einstellungen.value("playback/recent_files", [])
         if isinstance(dateien, str):
@@ -2121,7 +3396,10 @@ class SprachLernPlayer(QMainWindow):
         gesehen = set()
         for pfad in dateien:
             normiert = os.path.normcase(pfad)
-            if normiert not in gesehen and os.path.isfile(pfad):
+            if (
+                normiert not in gesehen and os.path.isfile(pfad)
+                and not self.liegt_im_cache(pfad)
+            ):
                 gesehen.add(normiert)
                 unique.append(pfad)
         return unique
@@ -2250,8 +3528,9 @@ class SprachLernPlayer(QMainWindow):
 
     def lade_audio_pfad(
         self, pfad, automatisch_starten=False, einstellungs_pfad=None,
-        satz_index_beim_wiederherstellen=None
+        satz_index_beim_wiederherstellen=None, force_reanalyse=False
     ):
+        self._cancel_translation_batch()
         quellpfad = einstellungs_pfad or pfad
         self.stimmen_widget.setVisible(
             os.path.splitext(quellpfad)[1].lower() == ".txt"
@@ -2286,8 +3565,13 @@ class SprachLernPlayer(QMainWindow):
         self.progress_bar.setRange(0, 0)
         self.progress_bar.show()
 
-        self.analyse_thread = AnalyseThread(self.mp3_pfad, self.aktuell_modell_name)
+        self.analyse_thread = AnalyseThread(
+            self.mp3_pfad,
+            self.aktuell_modell_name,
+            force_reanalyse=force_reanalyse,
+        )
         self.analyse_thread.status_update.connect(self.analyse_status_geaendert)
+        self.analyse_thread.fortschritt.connect(self.analyse_fortschritt)
         self.analyse_thread.analyse_beendet.connect(self.analyse_fertig)
         self.analyse_thread.finished.connect(
             lambda thread=self.analyse_thread: self.thread_beendet(thread)
@@ -2305,7 +3589,9 @@ class SprachLernPlayer(QMainWindow):
             return
 
         self.set_status("restoring")
-        if os.path.splitext(pfad)[1].lower() == ".txt":
+        if os.path.splitext(pfad)[1].lower() == ".stbook":
+            self.lade_stbook(pfad, automatisch_starten=True)
+        elif os.path.splitext(pfad)[1].lower() == ".txt":
             self.lade_text_datei(pfad, automatisch_starten=True)
         else:
             self.lade_audio_pfad(pfad, automatisch_starten=True)
@@ -2320,17 +3606,113 @@ class SprachLernPlayer(QMainWindow):
         self.einstellungen.setValue(f"{gruppe}/model", self.aktuell_modell_name)
         self.einstellungen.setValue("playback/last_file", self.quell_pfad)
         self.einstellungen.sync()
+        book_id = self._sync_book_id()
+        if book_id:
+            position = max(0, int(self.player.position()))
+            checkpoint = (book_id, position)
+            if (
+                self._sync_last_position is None
+                or self._sync_last_position[0] != book_id
+                or abs(position - self._sync_last_position[1]) >= 1500
+            ):
+                try:
+                    self.sync_server.store.merge({
+                        "version": 1,
+                        "words": {},
+                        "progress": {
+                            book_id: {
+                                "position_ms": position,
+                                "updated_at": int(time.time() * 1000),
+                            }
+                        },
+                    })
+                    self._sync_last_position = checkpoint
+                except (OSError, ValueError) as error:
+                    self.status_label.setToolTip(
+                        f"Could not save sync progress: {error}"
+                    )
         self.aktualisiere_dateiliste()
 
     def setze_bedienung(self, aktiv):
-        for b in (self.btn_zurueck, self.btn_play, self.btn_weiter, self.btn_wiederholen,
-                  self.btn_gemerkt, self.btn_skip):
+        for b in (self.btn_export, self.btn_zurueck, self.btn_play, self.btn_weiter,
+                  self.btn_wiederholen, self.btn_gemerkt, self.btn_skip):
             b.setEnabled(aktiv)
+        self.btn_reanalyse.setEnabled(
+            aktiv and bool(self.mp3_pfad) and not self.stbook_aktiv
+        )
+
+    def erzwinge_neuanalyse(self):
+        self._refresh_source(force_reanalyse=False)
+
+    def erzwinge_spracherkennung(self):
+        self._refresh_source(force_reanalyse=True)
+
+    def _refresh_source(self, force_reanalyse):
+        if (
+            not self.quell_pfad
+            or not self.mp3_pfad
+            or self.stbook_aktiv
+            or self.progress_bar.isVisible()
+        ):
+            return
+        antwort = QMessageBox.question(
+            self,
+            self.ui_text(
+                "refresh_speech_title" if force_reanalyse else "reanalyze_title"
+            ),
+            self.ui_text(
+                "refresh_speech_confirm" if force_reanalyse else "reanalyze_confirm"
+            ),
+        )
+        if antwort != QMessageBox.StandardButton.Yes:
+            return
+        self.speichere_wiedergabestand()
+        self.player.pause()
+        self.lade_audio_pfad(
+            self.mp3_pfad,
+            einstellungs_pfad=self.quell_pfad,
+            force_reanalyse=force_reanalyse,
+        )
+
+    def wiederhole_fehlende_uebersetzungen(self):
+        if (
+            not self.segmente
+            or self.stbook_aktiv
+            or self.progress_bar.isVisible()
+        ):
+            return
+        self._start_translation_batch()
+
+    def wiederhole_bilder_fuer_satz(self):
+        if (
+            not self.segmente
+            or self.stbook_aktiv
+            or self.aktueller_index < 0
+            or self.progress_bar.isVisible()
+        ):
+            return
+        indices = [self.aktueller_index]
+        next_index = self.aktueller_index + 1
+        while next_index < len(self.segmente) and not self.unbekannte_in_satz(
+            next_index
+        ):
+            next_index += 1
+        if next_index < len(self.segmente):
+            indices.append(next_index)
+        for index in indices:
+            for token in self.segmente[index]["tokens"]:
+                word = token["rein"]
+                if ist_wort(word):
+                    self.bilder_fehlgeschlagen.discard(word.casefold())
+        self.vorlade_bilder(self.aktueller_index)
 
     def analyse_fertig(self, daten):
         self.progress_bar.hide()
         self.btn_laden.setEnabled(True)
         if not daten or not daten.get("segmente"):
+            self.btn_reanalyse.setEnabled(
+                bool(self.mp3_pfad) and not self.stbook_aktiv
+            )
             self.zeige_platzhalter(
                 self.ui_text("no_sentences"), key="no_sentences"
             )
@@ -2353,6 +3735,145 @@ class SprachLernPlayer(QMainWindow):
         self.zeige_platzhalter(self.ui_text("press_play"), key="press_play")
         if self.player.mediaStatus() == QMediaPlayer.MediaStatus.LoadedMedia:
             self.medienstatus_geaendert(self.player.mediaStatus())
+        self._start_translation_batch()
+
+    def _cancel_translation_batch(self):
+        if self.translation_batch is None:
+            return
+        self.veroeffentliche_buch_fuer_sync()
+        self.translation_batch = None
+        self.combo_uebersetzung.setEnabled(True)
+        self.progress_bar.hide()
+        self.setze_bedienung(bool(self.segmente) and not self.stbook_aktiv)
+
+    def _start_translation_batch(self):
+        sprache = self.combo_uebersetzung.currentData()
+        texte = list(dict.fromkeys(
+            "".join(token["roh"] for token in segment["tokens"]).strip()
+            for segment in self.segmente
+        ))
+        texte = [text for text in texte if text]
+
+        fehlend = []
+        for text in texte:
+            key = (text, sprache)
+            if key in self.uebersetzungen:
+                continue
+            cache_key = self.uebersetzung_cache_schluessel(text, sprache)
+            gespeicherte_uebersetzung = self.einstellungen.value(
+                f"translation/cache/{cache_key}", "", type=str
+            )
+            if gespeicherte_uebersetzung:
+                self.uebersetzungen[key] = gespeicherte_uebersetzung
+            else:
+                fehlend.append(text)
+
+        self.translation_batch = {
+            "language": sprache,
+            "items": fehlend,
+            "index": 0,
+            "current": None,
+            "done": len(texte) - len(fehlend),
+            "failed": 0,
+            "total": len(texte),
+            "error": "",
+        }
+        self.combo_uebersetzung.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self.btn_reanalyse.setEnabled(False)
+        self.progress_bar.setRange(0, max(1, len(texte)))
+        self.progress_bar.setValue(len(texte) - len(fehlend))
+        self.progress_bar.show()
+        self._translation_batch_next()
+
+    def _translation_batch_update_progress(self):
+        batch = self.translation_batch
+        if batch is None:
+            return
+        done = min(batch["done"], batch["total"])
+        total = batch["total"]
+        self.progress_bar.setRange(0, max(1, total))
+        self.progress_bar.setValue(done)
+        remaining = max(0, total - done)
+        self.set_status(
+            "translation_batch_progress",
+            done=done,
+            total=total,
+            time=format_zeit(remaining * 1500),
+        )
+
+    def _translation_batch_next(self):
+        batch = self.translation_batch
+        if batch is None:
+            return
+        items = batch["items"]
+        while batch["index"] < len(items):
+            text = items[batch["index"]]
+            batch["index"] += 1
+            key = (text, batch["language"])
+            if key in self.uebersetzungen:
+                batch["done"] += 1
+                self._translation_batch_update_progress()
+                continue
+
+            batch["current"] = key
+            self._translation_batch_update_progress()
+            if key in self.uebersetzung_threads:
+                return
+
+            thread = UebersetzungThread(text, batch["language"], self)
+            self.uebersetzung_threads[key] = thread
+            thread.fertig.connect(self.uebersetzung_fertig)
+            thread.finished.connect(
+                lambda k=key, laufender_thread=thread:
+                self.uebersetzung_thread_beendet(k, laufender_thread)
+            )
+            self.starte_thread(thread)
+            return
+        self._finish_translation_batch()
+
+    def _finish_translation_batch(self):
+        batch = self.translation_batch
+        if batch is None:
+            return
+        self.translation_batch = None
+        self.combo_uebersetzung.setEnabled(True)
+        self.progress_bar.hide()
+        self.btn_export.setEnabled(True)
+        self.btn_reanalyse.setEnabled(
+            bool(self.segmente) and not self.stbook_aktiv
+        )
+        self.veroeffentliche_buch_fuer_sync()
+        if batch["failed"]:
+            self.set_status(
+                "translation_batch_partial",
+                failed=batch["failed"],
+                total=batch["total"],
+                error=batch["error"],
+            )
+        else:
+            self.set_status(
+                "translation_batch_complete",
+                done=batch["done"],
+                total=batch["total"],
+            )
+
+    def _translation_batch_result(self, key, error):
+        batch = self.translation_batch
+        if batch is None or batch["current"] != key:
+            return
+        batch["current"] = None
+        batch["done"] += 1
+        if error:
+            batch["failed"] += 1
+            batch["error"] = self.uebersetzung_fehlertext(error)
+            if error.startswith("RATE_LIMITED:"):
+                batch["failed"] += len(batch["items"]) - batch["index"]
+                self._translation_batch_update_progress()
+                self._finish_translation_batch()
+                return
+        self._translation_batch_update_progress()
+        self._translation_batch_next()
 
     def setze_daten(self, segmente):
         self.segmente = segmente
@@ -2649,6 +4170,16 @@ class SprachLernPlayer(QMainWindow):
             self.btn_uebersetzung_retry.hide()
             self.set_uebersetzungstext(self.uebersetzungen[key])
             return
+        if self.stbook_aktiv:
+            self.btn_uebersetzung_retry.hide()
+            self.uebersetzung_label.setText(
+                self.ui_text("translation_not_in_book")
+            )
+            return
+        batch = self.translation_batch
+        if batch is not None and sprache == batch["language"]:
+            self.uebersetzung_label.setText(self.ui_text("translation_loading"))
+            return
         if key in self.uebersetzung_threads:
             self.uebersetzung_label.setText(self.ui_text("translation_loading"))
             return
@@ -2694,6 +4225,7 @@ class SprachLernPlayer(QMainWindow):
             else:
                 self.btn_uebersetzung_retry.setVisible(rate_limited)
                 self.uebersetzung_label.setText(escape(ergebnis))
+        self._translation_batch_result(key, fehler)
 
     def set_uebersetzungstext(self, text):
         zielwoerter = list(re.finditer(r"\w+", text, re.UNICODE))
@@ -2877,8 +4409,11 @@ class SprachLernPlayer(QMainWindow):
 
     def gemini_bild_anfordern(self, wort, kontext, erneut=False):
         wort_lower = wort.casefold()
-        if (not os.environ.get("GEMINI_API_KEY", "").strip()
-                or os.path.isfile(gemini_bild_pfad(wort_lower))
+        if (self.stbook_aktiv
+                or not os.environ.get("GEMINI_API_KEY", "").strip()
+                or os.path.isfile(gemini_bild_pfad(
+                    wort_lower, self.bilder_ordnung_aktuell
+                ))
                 or wort_lower in self.gemini_bilder_in_arbeit
                 or (wort_lower in self.gemini_bilder_fehlgeschlagen and not erneut)):
             return
@@ -2899,7 +4434,11 @@ class SprachLernPlayer(QMainWindow):
             self.einstellungen.sync()
         self.gemini_bilder_fehlgeschlagen.pop(wort_lower, None)
         thread = GeminiBildThread(
-            wort_lower, wort, kontext, gemini_bild_pfad(wort_lower), self
+            wort_lower,
+            wort,
+            kontext,
+            gemini_bild_pfad(wort_lower, self.bilder_ordnung_aktuell),
+            self,
         )
         thread.fertig.connect(self.gemini_bild_fertig)
         thread.finished.connect(
@@ -2935,7 +4474,10 @@ class SprachLernPlayer(QMainWindow):
             zaehler = (None if bekanntes_wort else
                        f"{self.fokus_index + 1}/{len(self.aktuelle_unbekannte)}")
             for variante, openverse_pfad in enumerate(
-                openverse_bild_pfade(wort_lower), start=1
+                openverse_bild_pfade(
+                    wort_lower, self.bilder_ordnung_aktuell
+                ),
+                start=1,
             ):
                 openverse_pix = (
                     QPixmap(openverse_pfad)
@@ -2978,7 +4520,9 @@ class SprachLernPlayer(QMainWindow):
                 )
                 self.bilder_layout.addWidget(openverse_karte)
 
-            gemini_pfad = gemini_bild_pfad(wort_lower)
+            gemini_pfad = gemini_bild_pfad(
+                wort_lower, self.bilder_ordnung_aktuell
+            )
             gemini_pix = QPixmap(gemini_pfad) if os.path.exists(gemini_pfad) else None
             gemini_rating, gemini_positive, gemini_total = (
                 self.bild_feedback_statistik(wort, "gemini")
@@ -2989,6 +4533,9 @@ class SprachLernPlayer(QMainWindow):
                 retry_text = ""
             elif wort_lower in self.gemini_bilder_in_arbeit:
                 gemini_text = self.ui_text("image_gemini_loading")
+                retry_text = ""
+            elif self.stbook_aktiv:
+                gemini_text = self.ui_text("no_image")
                 retry_text = ""
             elif not os.environ.get("GEMINI_API_KEY", "").strip():
                 gemini_text = self.ui_text("image_gemini_no_key")
@@ -3071,8 +4618,7 @@ class SprachLernPlayer(QMainWindow):
                 translated_query=details.get("translated_query")
                 or self.ui_text("image_source_missing"),
                 title=details.get("title") or self.ui_text("image_unknown_title"),
-                description=details.get("description")
-                or self.ui_text("image_no_description"),
+                description=details.get("description"),
                 tags=tags,
                 context=kontext,
                 target=self.ui_text(ziel),
@@ -3090,7 +4636,7 @@ class SprachLernPlayer(QMainWindow):
         return erklaerung
 
     def vorlade_bilder(self, index):
-        if index < 0:
+        if self.stbook_aktiv or index < 0:
             return
 
         indices = [index]
@@ -3107,7 +4653,7 @@ class SprachLernPlayer(QMainWindow):
                 if not ist_wort(wort) or wort.lower() in self.bekannte_woerter:
                     continue
                 wl = wort.lower()
-                pfad = bild_pfad(wl)
+                pfad = bild_pfad(wl, self.bilder_ordnung_aktuell)
                 if (os.path.exists(pfad) or wl in self.bilder_in_arbeit
                         or wl in self.bilder_fehlgeschlagen):
                     continue
@@ -3212,9 +4758,7 @@ class SprachLernPlayer(QMainWindow):
         if not neu:
             return
         self.ausgewaehltes_bekanntes_wort = None
-        with open(WOERTERBUCH_DATEI, "a", encoding="utf-8") as f:
-            for wl in neu:
-                f.write(wl + "\n")  # UTF-8: ä, ö, ü, ß sind kein Problem
+        self.schreibe_woerterbuch()
         self.rueckgaengig_stack.append(neu)
         self.set_status("marked", words=", ".join(neu))
         self.nach_aenderung()
@@ -3273,6 +4817,8 @@ class SprachLernPlayer(QMainWindow):
         self.timer.stop()
         self.speicher_timer.stop()
         self.player.stop()
+        self.veroeffentliche_buch_fuer_sync()
+        self.sync_server.stop()
 
         for thread in tuple(self.aktive_threads):
             if thread.isRunning():
